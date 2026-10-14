@@ -53,3 +53,5 @@ If the organisation's repository is not listed, check the GitHub/Streamlit autho
 ## Methodology note
 
 K-Means uses six behavioural features only: StudyHours, Attendance, AssignmentCompletion, OnlineCourses, Discussions and EduTech. LearningStyle, ExamScore and FinalGrade are held out for post-clustering comparisons. Agglomerative clustering and DBSCAN comparisons use a reproducible sample to reduce cloud memory/time costs; explain this implementation detail in the presentation.
+# student-learning-style-clustering
+AI/ML Capstone Project - Student Learning-Style Clustering Behavioral Analysis
