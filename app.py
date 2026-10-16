@@ -1,476 +1,382 @@
 from pathlib import Path
-import urllib.request
-
+from io import BytesIO
+import warnings
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
-
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
-from sklearn.metrics import (
-    silhouette_score, davies_bouldin_score,
-    adjusted_rand_score, normalized_mutual_info_score
-)
+from sklearn.metrics import silhouette_score, davies_bouldin_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.neighbors import NearestNeighbors
 from scipy import stats
+from scipy.cluster.hierarchy import linkage, dendrogram
 
-# ------------------------------------------------------------
-# Page setup and project constants
-# ------------------------------------------------------------
-st.set_page_config(
-    page_title="Student Learning Behaviour Clustering",
-    page_icon="🎓",
-    layout="wide",
-)
+st.set_page_config(page_title="Student Learning-Style Clustering", layout="wide")
+sns.set_theme(style="whitegrid")
 RANDOM_STATE = 42
-EXPECTED_COLUMNS = [
-    "StudyHours", "Attendance", "Resources", "Extracurricular",
-    "Motivation", "Internet", "Gender", "Age", "LearningStyle",
-    "OnlineCourses", "Discussions", "AssignmentCompletion",
-    "ExamScore", "EduTech", "StressLevel", "FinalGrade",
-]
-CLUSTER_FEATURES = [
-    "StudyHours", "Attendance", "AssignmentCompletion",
-    "OnlineCourses", "Discussions", "EduTech",
-]
-CONTEXT_COLUMNS = ["Motivation", "StressLevel", "Resources", "Internet", "Extracurricular"]
-DATA_URL = "https://zenodo.org/records/16459132/files/merged_dataset.csv?download=1"
+EXPECTED_COLUMNS = ["StudyHours", "Attendance", "Resources", "Extracurricular", "Motivation", "Internet", "Gender", "Age", "LearningStyle", "OnlineCourses", "Discussions", "AssignmentCompletion", "ExamScore", "EduTech", "StressLevel", "FinalGrade"]
+CLUSTER_FEATURES = ["StudyHours", "Attendance", "AssignmentCompletion", "OnlineCourses", "Discussions", "EduTech"]
 
+st.title("Student Learning-Style Clustering Based on Learning Behavior")
+st.caption("AI/ML Engineer Certification Capstone | Based on the supplied Google Colab notebook")
 
 @st.cache_data(show_spinner=False)
-def load_data(uploaded_file=None):
-    """Load a user-uploaded CSV, local project CSV, or the notebook's Zenodo source."""
-    if uploaded_file is not None:
-        data = pd.read_csv(uploaded_file)
-        source = "Uploaded CSV"
-    else:
-        candidates = [Path("student_performance.csv"), Path("merged_dataset.csv")]
-        local = next((p for p in candidates if p.exists()), None)
-        if local:
-            data = pd.read_csv(local)
-            source = str(local)
-        else:
-            try:
-                data = pd.read_csv(DATA_URL)
-                source = "Zenodo public dataset"
-            except Exception as exc:
-                raise RuntimeError(
-                    "Could not load the public dataset. Upload the project CSV in the sidebar "
-                    "or add student_performance.csv / merged_dataset.csv to the repository. "
-                    f"Details: {exc}"
-                ) from exc
+def load_dataset(uploaded_bytes=None, uploaded_name=None):
+    if uploaded_bytes is not None:
+        return pd.read_csv(BytesIO(uploaded_bytes)), f"Uploaded CSV: {uploaded_name}"
+    # First preference: the public Kaggle dataset used in the notebook.
+    try:
+        import kagglehub
+        downloaded = Path(kagglehub.dataset_download("adilshamim8/student-performance-and-learning-style"))
+        csv_files = sorted(downloaded.rglob("*.csv"))
+        if csv_files:
+            return pd.read_csv(csv_files[0]), f"KaggleHub: {csv_files[0].name}"
+        kaggle_error = "KaggleHub did not return a CSV file."
+    except Exception as exc:
+        kaggle_error = str(exc)
+    # Local files and Zenodo are fallbacks, matching the notebook's intent.
+    for candidate in [Path("student_performance.csv"), Path("merged_dataset.csv")]:
+        if candidate.exists():
+            return pd.read_csv(candidate), f"Local file: {candidate.name}"
+    try:
+        import requests
+        url = "https://zenodo.org/records/16459132/files/merged_dataset.csv?download=1"
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        return pd.read_csv(BytesIO(response.content)), "Zenodo fallback"
+    except Exception as exc:
+        raise RuntimeError(f"Kaggle download failed ({kaggle_error}); Zenodo fallback also failed ({exc}). Upload the exact CSV used in Colab.") from exc
 
-    missing = [c for c in EXPECTED_COLUMNS if c not in data.columns]
+@st.cache_data(show_spinner="Running the notebook analysis…")
+def analyse(raw_csv_bytes=None, raw_csv_name=None):
+    source_df, source = load_dataset(raw_csv_bytes, raw_csv_name)
+    missing = [c for c in EXPECTED_COLUMNS if c not in source_df.columns]
     if missing:
-        raise ValueError(
-            "This CSV does not match the 16-column dataset used in the capstone. "
-            f"Missing columns: {', '.join(missing)}"
-        )
-    data = data[EXPECTED_COLUMNS].copy()
-    raw_rows = len(data)
-    duplicate_count = int(data.duplicated().sum())
-    data = data.drop_duplicates().reset_index(drop=True)
-    return data, source, raw_rows, duplicate_count
-
-
-@st.cache_data(show_spinner="Preparing clustering analysis...")
-def run_analysis(data):
-    """Fit clustering on the six behavioural features; use other variables only for profiling."""
-    df = data.copy()
+        raise ValueError("Dataset is missing required columns: " + ", ".join(missing))
+    raw_n = len(source_df)
+    df = source_df[EXPECTED_COLUMNS].copy()
+    duplicate_count = int(df.duplicated().sum())
+    df = df.drop_duplicates().reset_index(drop=True)
     X = df[CLUSTER_FEATURES].copy()
-    for col in CLUSTER_FEATURES:
-        X[col] = pd.to_numeric(X[col], errors="coerce")
-    X = X.fillna(X.median(numeric_only=True))
-    if X.isna().any().any():
-        raise ValueError("One or more behavioural columns contain no usable numeric values.")
-
+    if X.isna().sum().sum() > 0:
+        X = X.fillna(X.median(numeric_only=True))
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    # Sample silhouette computations for responsiveness on the public dataset.
+    X_scaled_df = pd.DataFrame(X_scaled, columns=CLUSTER_FEATURES, index=df.index)
+    pca = PCA(n_components=2, random_state=RANDOM_STATE)
+    X_pca = pca.fit_transform(X_scaled)
+    loadings = pd.DataFrame(pca.components_.T, index=CLUSTER_FEATURES, columns=["PC1", "PC2"])
     k_values = list(range(2, 9))
     inertias, silhouettes = [], []
     for k in k_values:
-        model = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        model = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=20)
         labels = model.fit_predict(X_scaled)
-        inertias.append(model.inertia_)
-        silhouettes.append(silhouette_score(
-            X_scaled, labels, sample_size=min(5000, len(X_scaled)),
-            random_state=RANDOM_STATE
-        ))
+        inertias.append(float(model.inertia_))
+        silhouettes.append(float(silhouette_score(X_scaled, labels)))
     k_results = pd.DataFrame({"k": k_values, "inertia": inertias, "silhouette": silhouettes})
     best_k = int(k_results.loc[k_results["silhouette"].idxmax(), "k"])
-
-    kmeans = KMeans(n_clusters=best_k, random_state=RANDOM_STATE, n_init=20)
+    best_silhouette = float(k_results["silhouette"].max())
+    kmeans = KMeans(n_clusters=best_k, random_state=RANDOM_STATE, n_init=50)
     df["Cluster"] = kmeans.fit_predict(X_scaled)
-    k_sil = silhouette_score(
-        X_scaled, df["Cluster"], sample_size=min(5000, len(X_scaled)),
-        random_state=RANDOM_STATE
-    )
-    k_dbi = davies_bouldin_score(X_scaled, df["Cluster"])
-
-    pca = PCA(n_components=2, random_state=RANDOM_STATE)
-    X_pca = pca.fit_transform(X_scaled)
-    pca_df = pd.DataFrame(X_pca, columns=["PC1", "PC2"], index=df.index)
-    pca_df["Cluster"] = df["Cluster"].astype(str)
-
-    # Use a reproducible sample for quadratic-cost comparison methods.
-    rng = np.random.default_rng(RANDOM_STATE)
-    sample_n = min(3000, len(X_scaled))
-    sample_idx = rng.choice(len(X_scaled), size=sample_n, replace=False)
-    X_compare = X_scaled[sample_idx]
-
-    agglo = AgglomerativeClustering(n_clusters=best_k, linkage="ward")
-    agg_labels = agglo.fit_predict(X_compare)
-    agg_sil = silhouette_score(
-        X_compare, agg_labels, sample_size=min(2000, len(X_compare)),
-        random_state=RANDOM_STATE
-    )
-    agg_dbi = davies_bouldin_score(X_compare, agg_labels)
-
-    nn = NearestNeighbors(n_neighbors=5).fit(X_scaled)
+    k_sil = float(silhouette_score(X_scaled, df["Cluster"]))
+    k_dbi = float(davies_bouldin_score(X_scaled, df["Cluster"]))
+    agg = AgglomerativeClustering(n_clusters=best_k, linkage="ward")
+    df["Cluster_Agglomerative"] = agg.fit_predict(X_scaled)
+    agg_sil = float(silhouette_score(X_scaled, df["Cluster_Agglomerative"]))
+    agg_dbi = float(davies_bouldin_score(X_scaled, df["Cluster_Agglomerative"]))
+    min_samples = 5
+    nn = NearestNeighbors(n_neighbors=min_samples).fit(X_scaled)
     distances, _ = nn.kneighbors(X_scaled)
     kdist = np.sort(distances[:, -1])
-    candidate_eps = np.unique(np.round(np.quantile(
-        kdist, [0.80, 0.85, 0.90, 0.92, 0.94, 0.96, 0.98]
-    ), 3))
+    candidate_eps = np.unique(np.round(np.quantile(kdist, [0.80, 0.85, 0.90, 0.92, 0.94, 0.95, 0.96, 0.97, 0.98]), 3))
     db_rows = []
-    # Evaluate DBSCAN on a sample to limit deployment compute.
     for eps in candidate_eps:
-        labels = DBSCAN(eps=float(eps), min_samples=5).fit_predict(X_compare)
+        labels = DBSCAN(eps=float(eps), min_samples=min_samples).fit_predict(X_scaled)
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         noise_pct = 100 * np.mean(labels == -1)
-        valid = labels != -1
-        if n_clusters >= 2 and valid.sum() > n_clusters:
-            sil = silhouette_score(
-                X_compare[valid], labels[valid],
-                sample_size=min(2000, int(valid.sum())), random_state=RANDOM_STATE
-            )
-            dbi = davies_bouldin_score(X_compare[valid], labels[valid])
+        if n_clusters >= 2 and np.sum(labels != -1) > n_clusters:
+            mask = labels != -1
+            sil = float(silhouette_score(X_scaled[mask], labels[mask]))
+            dbi = float(davies_bouldin_score(X_scaled[mask], labels[mask]))
         else:
             sil, dbi = np.nan, np.nan
-        db_rows.append({
-            "eps": float(eps), "clusters": n_clusters,
-            "noise_percent": noise_pct, "silhouette": sil, "davies_bouldin": dbi
-        })
+        db_rows.append({"eps": float(eps), "clusters": n_clusters, "noise_percent": noise_pct, "silhouette": sil, "davies_bouldin": dbi})
     db_results = pd.DataFrame(db_rows)
-    valid_db = db_results.dropna(subset=["silhouette"])
-    if not valid_db.empty:
-        best_db = valid_db.loc[valid_db["silhouette"].idxmax()]
-        db_sil = float(best_db["silhouette"])
-        db_dbi = float(best_db["davies_bouldin"])
-        db_labels = DBSCAN(eps=float(best_db["eps"]), min_samples=5).fit_predict(X_scaled)
-        db_clusters = int(len(set(db_labels)) - (1 if -1 in db_labels else 0))
+    valid_db = db_results.dropna(subset=["silhouette"]).copy()
+    if len(valid_db):
+        preferred = valid_db[valid_db["noise_percent"] <= 20]
+        db_choice = preferred if len(preferred) else valid_db
+        best_eps = float(db_choice.sort_values(["silhouette", "noise_percent"], ascending=[False, True]).iloc[0]["eps"])
+        df["Cluster_DBSCAN"] = DBSCAN(eps=best_eps, min_samples=min_samples).fit_predict(X_scaled)
+        db_mask = df["Cluster_DBSCAN"] != -1
+        db_clusters = len(set(df["Cluster_DBSCAN"])) - (1 if -1 in df["Cluster_DBSCAN"].values else 0)
+        if db_clusters >= 2 and db_mask.sum() > db_clusters:
+            db_sil = float(silhouette_score(X_scaled[db_mask], df.loc[db_mask, "Cluster_DBSCAN"]))
+            db_dbi = float(davies_bouldin_score(X_scaled[db_mask], df.loc[db_mask, "Cluster_DBSCAN"]))
+        else:
+            db_sil, db_dbi = np.nan, np.nan
     else:
-        db_sil, db_dbi, db_clusters = np.nan, np.nan, 0
-
-    profiles = df.groupby("Cluster")[CLUSTER_FEATURES + [
-        "Motivation", "StressLevel", "Resources", "Internet",
-        "Extracurricular", "ExamScore", "FinalGrade"
-    ]].mean(numeric_only=True).round(2)
-    centroids = pd.DataFrame(kmeans.cluster_centers_, columns=CLUSTER_FEATURES)
-    centroids.index.name = "Cluster"
-    global_means = df[CLUSTER_FEATURES].mean(numeric_only=True)
-
-    recommendations = []
-    for cid in sorted(df["Cluster"].unique()):
-        row = profiles.loc[cid, CLUSTER_FEATURES]
-        ordered = centroids.loc[cid].sort_values()
-        high = ", ".join(ordered.tail(2).index)
-        low = ", ".join(ordered.head(2).index)
-        support = []
-        if row["Attendance"] < global_means["Attendance"]:
-            support.append("attendance support and reminders")
-        if row["AssignmentCompletion"] < global_means["AssignmentCompletion"]:
-            support.append("assignment planning and deadline support")
-        if row["StudyHours"] < global_means["StudyHours"]:
-            support.append("structured study scheduling")
-        if row["OnlineCourses"] < global_means["OnlineCourses"]:
-            support.append("guided supplementary online learning")
-        if row["Discussions"] < global_means["Discussions"]:
-            support.append("peer discussion or collaborative learning")
-        if row["EduTech"] < global_means["EduTech"]:
-            support.append("educational technology orientation")
-        if not support:
-            support = ["enrichment activities and advanced self-directed resources"]
-        recommendations.append({
-            "Cluster": int(cid),
-            "Observed behaviour": f"Relatively high {high}; relatively low {low}.",
-            "Recommended support": "; ".join(support[:3])
-        })
-    recommendation_table = pd.DataFrame(recommendations)
-
-    learning_crosstab = pd.crosstab(
-        df["Cluster"], df["LearningStyle"], normalize="index"
-    ).mul(100).round(1)
-    ari = adjusted_rand_score(df["LearningStyle"], df["Cluster"])
-    nmi = normalized_mutual_info_score(df["LearningStyle"], df["Cluster"])
-
-    outcome_profile = df.groupby("Cluster")[["ExamScore", "FinalGrade"]].agg(
-        ["mean", "median", "std"]
-    ).round(2)
-    groups = [g["ExamScore"].dropna().values for _, g in df.groupby("Cluster")]
-    groups = [g for g in groups if len(g) > 1]
-    if len(groups) >= 2:
-        anova = stats.f_oneway(*groups)
-        grand_mean = df["ExamScore"].mean()
-        valid_scores = df[["ExamScore", "Cluster"]].dropna()
-        ss_between = sum(
-            len(g) * (g.mean() - grand_mean) ** 2 for g in groups
-        )
-        ss_total = ((valid_scores["ExamScore"] - grand_mean) ** 2).sum()
-        eta_squared = float(ss_between / ss_total) if ss_total else np.nan
-        anova_f, anova_p = float(anova.statistic), float(anova.pvalue)
-    else:
-        eta_squared, anova_f, anova_p = np.nan, np.nan, np.nan
-
-    comparison = pd.DataFrame({
-        "Model": ["K-Means", "Agglomerative (sample)", "DBSCAN (sample)"],
-        "Silhouette": [k_sil, agg_sil, db_sil],
-        "Davies-Bouldin": [k_dbi, agg_dbi, db_dbi],
+        best_eps, db_clusters, db_sil, db_dbi = np.nan, 0, np.nan, np.nan
+        df["Cluster_DBSCAN"] = -1
+    comparison = pd.DataFrame({"Model": ["K-Means", "Agglomerative", "DBSCAN"], "Silhouette": [k_sil, agg_sil, db_sil], "Davies_Bouldin": [k_dbi, agg_dbi, db_dbi]})
+    best_model = comparison.loc[comparison["Silhouette"].idxmax(), "Model"] if comparison["Silhouette"].notna().any() else "K-Means"
+    profile_cols = CLUSTER_FEATURES + ["Motivation", "StressLevel", "Resources", "Internet", "Extracurricular", "ExamScore", "FinalGrade"]
+    cluster_profile = df.groupby("Cluster")[profile_cols].mean().round(2)
+    centroid_profile = pd.DataFrame(kmeans.cluster_centers_, columns=CLUSTER_FEATURES).round(2)
+    centroid_profile.index.name = "Cluster"
+    crosstab = pd.crosstab(df["Cluster"], df["LearningStyle"], normalize="index").mul(100).round(1)
+    ari = float(adjusted_rand_score(df["LearningStyle"], df["Cluster"]))
+    nmi = float(normalized_mutual_info_score(df["LearningStyle"], df["Cluster"]))
+    outcome_profile = df.groupby("Cluster")[["ExamScore", "FinalGrade"]].agg(["mean", "median", "std"]).round(2)
+    groups = [g["ExamScore"].values for _, g in df.groupby("Cluster")]
+    anova = stats.f_oneway(*groups)
+    grand_mean = df["ExamScore"].mean()
+    ss_between = sum(len(g) * (g.mean() - grand_mean) ** 2 for g in groups)
+    ss_total = ((df["ExamScore"] - grand_mean) ** 2).sum()
+    eta_squared = float(ss_between / ss_total) if ss_total else np.nan
+    context_profile = df.groupby("Cluster")[["Motivation", "StressLevel", "Resources", "Internet", "Extracurricular"]].mean().round(2)
+    global_means = df[CLUSTER_FEATURES].mean()
+    def describe_cluster(cid, centroid_row, top_n=2):
+        ordered = centroid_row.sort_values()
+        return f"Cluster {cid}: relatively high {', '.join(ordered.tail(top_n).index)}; relatively low {', '.join(ordered.head(top_n).index)}."
+    def make_recommendation(cid):
+        row = cluster_profile.loc[cid, CLUSTER_FEATURES]
+        recs = []
+        checks = [("Attendance", "attendance support and reminders"), ("AssignmentCompletion", "assignment planning and deadline support"), ("StudyHours", "structured study scheduling"), ("OnlineCourses", "guided use of supplementary online learning"), ("Discussions", "peer discussion or collaborative learning opportunities"), ("EduTech", "orientation to educational technology tools")]
+        for col, rec in checks:
+            if row[col] < global_means[col]:
+                recs.append(rec)
+        return "; ".join(recs[:3]) if recs else "enrichment activities and advanced self-directed resources"
+    recommendation_table = pd.DataFrame({
+        "Cluster": sorted(df["Cluster"].unique()),
+        "Observed_behavior": [describe_cluster(cid, centroid_profile.loc[cid]) for cid in sorted(df["Cluster"].unique())],
+        "Recommended_support": [make_recommendation(cid) for cid in sorted(df["Cluster"].unique())]
     })
+    sample_n = min(1000, len(X_scaled))
+    rng = np.random.default_rng(RANDOM_STATE)
+    sample_idx = rng.choice(len(X_scaled), size=sample_n, replace=False)
+    linked = linkage(X_scaled[sample_idx], method="ward")
+    # Streamlit caches this function result; nested helper functions are not safely serializable.
+    analysis_results = locals().copy()
+    return {key: value for key, value in analysis_results.items() if not callable(value)}
 
-    return {
-        "df": df, "X": X, "X_scaled": X_scaled, "X_pca": X_pca,
-        "pca_variance": pca.explained_variance_ratio_,
-        "k_results": k_results, "best_k": best_k, "k_sil": k_sil, "k_dbi": k_dbi,
-        "agg_sil": agg_sil, "agg_dbi": agg_dbi, "db_sil": db_sil, "db_dbi": db_dbi,
-        "db_results": db_results, "db_clusters": db_clusters,
-        "profiles": profiles, "centroids": centroids, "recommendations": recommendation_table,
-        "learning_crosstab": learning_crosstab, "ari": ari, "nmi": nmi,
-        "outcome_profile": outcome_profile, "anova_f": anova_f, "anova_p": anova_p,
-        "eta_squared": eta_squared, "comparison": comparison,
-    }
-
-
-# ------------------------------------------------------------
-# Sidebar: data source and navigation
-# ------------------------------------------------------------
-st.sidebar.title("🎓 Capstone navigation")
-st.sidebar.caption("TechCrush Cohort 8 · AI/ML Engineer Certification")
-uploaded = st.sidebar.file_uploader("Optional: upload the project CSV", type=["csv"])
-st.sidebar.info(
-    "Expected columns include StudyHours, Attendance, AssignmentCompletion, "
-    "OnlineCourses, Discussions, EduTech, LearningStyle, ExamScore and FinalGrade."
-)
-
-st.title("Student Learning-Style Clustering Based on Learning Behavior")
-st.markdown(
-    "An interactive unsupervised machine-learning capstone that identifies student "
-    "behavioural segments and explores how they relate to reported learning styles "
-    "and academic outcomes."
-)
-
+uploaded = st.sidebar.file_uploader("Upload the same CSV used in Colab (optional)", type=["csv"])
+st.sidebar.caption("Without an upload, the app tries Kaggle first, then local CSV files, then Zenodo.")
 try:
-    data, source, raw_rows, duplicate_count = load_data(uploaded)
-    results = run_analysis(data)
-except Exception as exc:
-    st.error(str(exc))
+    result = analyse(uploaded.getvalue() if uploaded else None, uploaded.name if uploaded else None)
+except Exception as e:
+    st.error(f"Could not load or analyse the dataset: {e}")
+    st.info("If Kaggle access is unavailable, upload the exact CSV used in your Colab notebook.")
     st.stop()
 
-df = results["df"]
-st.caption(f"Data source: {source} · Exact duplicates removed: {duplicate_count:,}")
-
-pages = [
-    "Project overview", "Data explorer", "Exploratory analysis",
-    "Cluster discovery", "Model comparison", "Cluster profiles",
-    "Learning-style validation", "Academic outcomes", "Recommendations",
-]
-page = st.sidebar.radio("Choose a section", pages)
+df = result["df"]
+data = df[EXPECTED_COLUMNS].copy()
+source = result["source"]
+st.sidebar.success(f"Data source: {source}")
+page = st.sidebar.radio("Choose a section", [
+    "Project overview", "Data quality audit", "Data explorer", "Exploratory data analysis",
+    "Feature engineering and PCA", "K-Means model selection", "Cluster discovery", "Model comparison",
+    "Cluster profiles and recommendations", "Learning-style validation", "Academic outcomes", "Executive summary"
+])
 
 if page == "Project overview":
-    st.subheader("Project overview")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Raw records", f"{raw_rows:,}")
-    c2.metric("Analytical records", f"{len(df):,}")
-    c3.metric("Behavioural features", len(CLUSTER_FEATURES))
-    c4.metric("K-Means clusters", results["best_k"])
-    st.markdown("### Research approach")
-    st.write(
-        "The app clusters students using six behavioural variables only. LearningStyle, "
-        "ExamScore and FinalGrade are held out and analysed after cluster formation."
-    )
-    st.markdown("### Behavioural features used")
-    st.write(", ".join(CLUSTER_FEATURES))
-    st.markdown("### Methodology")
-    st.markdown(
-        "1. Validate the expected dataset columns and remove exact duplicate rows.\n"
-        "2. Impute missing clustering-feature values with the column median.\n"
-        "3. Standardise the six behavioural features.\n"
-        "4. Select K-Means cluster count using silhouette scores for k = 2–8.\n"
-        "5. Compare K-Means with Agglomerative clustering and DBSCAN.\n"
-        "6. Profile clusters, then evaluate learning-style composition and academic outcomes."
-    )
-    st.warning(
-        "Interpret clusters as patterns in this dataset, not permanent student identities. "
-        "Associations do not establish causation."
-    )
-
+    st.subheader("Project objective")
+    st.write("Discover student learning-behavior profiles using unsupervised machine learning. LearningStyle, ExamScore and FinalGrade are excluded from the clustering inputs and examined afterward.")
+    st.markdown("**Six clustering features**")
+    st.code(", ".join(CLUSTER_FEATURES))
+    c1,c2,c3=st.columns(3)
+    c1.metric("Raw records", f'{result["raw_n"]:,}')
+    c2.metric("Exact duplicates removed", f'{result["duplicate_count"]:,}')
+    c3.metric("Analytical records", f'{len(df):,}')
+    st.markdown("**Notebook workflow:** data audit → behavioral feature selection → standardization → PCA → K-Means selection → K-Means, Agglomerative and DBSCAN comparison → interpretation and outcome analysis.")
+elif page == "Data quality audit":
+    st.subheader("Data quality audit")
+    st.write("The notebook removes exact duplicate rows only and does not automatically remove outliers.")
+    st.write("Initial raw rows:", result["raw_n"], "| Exact duplicate rows:", result["duplicate_count"], "| Rows after duplicate removal:", len(data))
+    st.markdown("**Data types (original 16 columns only)**")
+    st.dataframe(data.dtypes.astype(str).rename("dtype").to_frame(), use_container_width=True)
+    st.markdown("**Missing values (original 16 columns only)**")
+    st.dataframe(data.isna().sum().rename("missing").to_frame(), use_container_width=True)
+    st.markdown("**Numeric summary (original 16 columns only)**")
+    st.dataframe(data.describe().T, use_container_width=True)
+    checks = {"Age": (18,30), "Attendance": (0,100), "AssignmentCompletion": (0,100), "ExamScore": (0,100)}
+    st.markdown("**Basic range checks**")
+    st.dataframe(pd.DataFrame([{"Column": c, "Allowed minimum": lo, "Allowed maximum": hi, "Values outside range": int(((data[c] < lo) | (data[c] > hi)).sum())} for c,(lo,hi) in checks.items()]), use_container_width=True)
 elif page == "Data explorer":
-    st.subheader("Dataset preview")
-    st.write(f"Rows after duplicate removal: **{len(df):,}** · Columns: **{df.shape[1]}**")
-    st.dataframe(df.head(100), use_container_width=True)
-    left, right = st.columns(2)
-    with left:
-        st.markdown("#### Missing values")
-        st.dataframe(df.isna().sum().rename("Missing values").to_frame(), use_container_width=True)
-    with right:
-        st.markdown("#### Numeric summary")
-        st.dataframe(df.describe().T, use_container_width=True)
-    st.download_button(
-        "Download cleaned dataset",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="student_learning_behaviour_cleaned.csv",
-        mime="text/csv",
-    )
-
-elif page == "Exploratory analysis":
-    st.subheader("Exploratory data analysis")
-    selected = st.multiselect("Select behavioural variables", CLUSTER_FEATURES, default=CLUSTER_FEATURES)
-    if selected:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        sns.boxplot(data=df[selected], ax=ax)
-        ax.set_title("Distribution of behavioural variables")
-        ax.tick_params(axis="x", rotation=25)
-        st.pyplot(fig)
-        plt.close(fig)
-        fig, ax = plt.subplots(figsize=(8, 6))
-        sns.heatmap(df[selected].corr(), annot=True, fmt=".2f", cmap="vlag", center=0, ax=ax)
-        ax.set_title("Correlation matrix")
-        st.pyplot(fig)
-        plt.close(fig)
-    col1, col2 = st.columns(2)
-    with col1:
-        fig, ax = plt.subplots(figsize=(7, 4))
-        sns.countplot(data=df, x="LearningStyle", ax=ax)
-        ax.set_title("Reported learning-style categories")
-        st.pyplot(fig)
-        plt.close(fig)
-    with col2:
-        fig, ax = plt.subplots(figsize=(7, 4))
-        sns.histplot(data=df, x="ExamScore", kde=True, ax=ax)
-        ax.set_title("Exam score distribution")
-        st.pyplot(fig)
-        plt.close(fig)
-
+    st.subheader("Cleaned source dataset preview")
+    st.dataframe(data.head(100), use_container_width=True)
+    st.markdown("**Missing values**")
+    st.dataframe(data.isna().sum().rename("Missing values").to_frame(), use_container_width=True)
+    st.markdown("**Data types**")
+    st.dataframe(data.dtypes.astype(str).rename("Data type").to_frame(), use_container_width=True)
+    st.download_button("Download cleaned source dataset", data.to_csv(index=False).encode(), "student_learning_style_cleaned_source.csv", "text/csv")
+elif page == "Exploratory data analysis":
+    st.subheader("Distribution of core behavioral variables")
+    fig, axes = plt.subplots(2,3,figsize=(15,8))
+    for ax,col in zip(axes.flat, CLUSTER_FEATURES):
+        sns.histplot(data[col], kde=True, ax=ax); ax.set_title(col)
+    st.pyplot(fig); plt.close(fig)
+    fig, ax = plt.subplots(figsize=(9,7))
+    sns.heatmap(data[CLUSTER_FEATURES].corr(), annot=True, fmt=".2f", cmap="vlag", center=0, ax=ax)
+    ax.set_title("Correlation Matrix: Core Learning-Behavior Variables")
+    st.pyplot(fig); plt.close(fig)
+    fig, axes = plt.subplots(1,3,figsize=(16,5))
+    sns.countplot(data=data,x="LearningStyle",ax=axes[0]); axes[0].set_title("Reported Learning-Style Codes")
+    sns.histplot(data["ExamScore"],kde=True,ax=axes[1]); axes[1].set_title("Exam Score Distribution")
+    sns.countplot(data=data,x="FinalGrade",ax=axes[2]); axes[2].set_title("Final Grade Codes")
+    st.pyplot(fig); plt.close(fig)
+elif page == "Feature engineering and PCA":
+    st.subheader("Feature selection")
+    st.write("Only these six variables are used for clustering:")
+    st.code(", ".join(CLUSTER_FEATURES))
+    st.markdown("**Missing values in clustering features**")
+    st.dataframe(data[CLUSTER_FEATURES].isna().sum().rename("missing").to_frame(), use_container_width=True)
+    st.markdown("**Clustering feature summary**")
+    st.dataframe(data[CLUSTER_FEATURES].describe().T, use_container_width=True)
+    st.markdown("**Standardized feature summary**")
+    st.dataframe(result["X_scaled_df"].describe().T, use_container_width=True)
+    st.write("PC1 explained variance:", round(result["pca"].explained_variance_ratio_[0],4))
+    st.write("PC2 explained variance:", round(result["pca"].explained_variance_ratio_[1],4))
+    st.write("Total 2D explained variance:", round(result["pca"].explained_variance_ratio_.sum(),4))
+    fig,ax=plt.subplots(figsize=(8,6)); ax.scatter(result["X_pca"][:,0],result["X_pca"][:,1],alpha=.35,s=18); ax.set(xlabel="PC1",ylabel="PC2",title="PCA Projection of Student Learning Behavior"); st.pyplot(fig); plt.close(fig)
+    st.markdown("**PCA loadings**"); st.dataframe(result["loadings"].sort_values("PC1",key=np.abs,ascending=False),use_container_width=True)
+elif page == "K-Means model selection":
+    st.subheader("Elbow and silhouette analysis")
+    st.dataframe(result["k_results"], use_container_width=True)
+    fig,axes=plt.subplots(1,2,figsize=(13,5))
+    axes[0].plot(result["k_results"]["k"],result["k_results"]["inertia"],marker="o"); axes[0].axvline(result["best_k"],linestyle="--",alpha=.7); axes[0].set(title="Elbow Method",xlabel="Number of clusters (k)",ylabel="Inertia")
+    axes[1].plot(result["k_results"]["k"],result["k_results"]["silhouette"],marker="o"); axes[1].axvline(result["best_k"],linestyle="--",alpha=.7); axes[1].set(title="Silhouette Scores",xlabel="Number of clusters (k)",ylabel="Silhouette score")
+    st.pyplot(fig); plt.close(fig)
+    st.success(f'Selected K-Means k = {result["best_k"]}; best silhouette = {result["best_silhouette"]:.3f}')
 elif page == "Cluster discovery":
-    st.subheader("K-Means cluster discovery")
-    st.metric("Selected k", results["best_k"])
-    st.write(
-        f"Silhouette score: **{results['k_sil']:.3f}** · "
-        f"Davies–Bouldin index: **{results['k_dbi']:.3f}**"
-    )
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].plot(results["k_results"]["k"], results["k_results"]["inertia"], marker="o")
-    axes[0].axvline(results["best_k"], linestyle="--")
-    axes[0].set_title("Elbow method")
-    axes[0].set_xlabel("k")
-    axes[0].set_ylabel("Inertia")
-    axes[1].plot(results["k_results"]["k"], results["k_results"]["silhouette"], marker="o")
-    axes[1].axvline(results["best_k"], linestyle="--")
-    axes[1].set_title("Silhouette score")
-    axes[1].set_xlabel("k")
-    axes[1].set_ylabel("Score")
-    st.pyplot(fig)
-    plt.close(fig)
-
-    pca_df = pd.DataFrame(results["X_pca"], columns=["PC1", "PC2"])
-    pca_df["Cluster"] = df["Cluster"].astype(str).values
-    fig, ax = plt.subplots(figsize=(9, 6))
-    sns.scatterplot(data=pca_df, x="PC1", y="PC2", hue="Cluster", alpha=0.55, s=25, ax=ax)
-    ax.set_title("PCA projection of K-Means behavioural clusters")
-    st.pyplot(fig)
-    plt.close(fig)
-    st.caption(
-        f"PC1 explains {results['pca_variance'][0]:.1%} and PC2 explains "
-        f"{results['pca_variance'][1]:.1%} of variance."
-    )
-    sizes = df["Cluster"].value_counts().sort_index().rename("Students").to_frame()
-    sizes["Percentage"] = (sizes["Students"] / len(df) * 100).round(1)
-    st.dataframe(sizes, use_container_width=True)
-
+    st.subheader("Cluster discovery")
+    st.write(f'K-Means silhouette: {result["k_sil"]:.3f} | Davies-Bouldin: {result["k_dbi"]:.3f}')
+    st.write(f'Agglomerative silhouette: {result["agg_sil"]:.3f} | Davies-Bouldin: {result["agg_dbi"]:.3f}')
+    st.markdown("**K-Means cluster sizes**")
+    sizes=df["Cluster"].value_counts().sort_index().rename("count").to_frame(); sizes["percentage"]=100*sizes["count"]/len(df); st.dataframe(sizes,use_container_width=True)
+    fig,ax=plt.subplots(figsize=(9,7)); sns.scatterplot(x=result["X_pca"][:,0],y=result["X_pca"][:,1],hue=df["Cluster"].astype(str),alpha=.55,s=35,ax=ax); ax.set(title=f'K-Means Behavioral Clusters (k={result["best_k"]})',xlabel="PC1",ylabel="PC2"); st.pyplot(fig); plt.close(fig)
+    fig,ax=plt.subplots(figsize=(12,6)); dendrogram(result["linked"],truncate_mode="lastp",p=30,no_labels=True,ax=ax); ax.set(title="Hierarchical Clustering Dendrogram (sample for readability)",xlabel="Merged observations / groups",ylabel="Ward distance"); st.pyplot(fig); plt.close(fig)
+    st.markdown("**DBSCAN parameter search**"); st.dataframe(result["db_results"],use_container_width=True)
+    st.write("Selected DBSCAN eps:", result["best_eps"])
+    st.write("DBSCAN clusters:", result["db_clusters"])
+    st.write("DBSCAN silhouette excluding noise:", result["db_sil"] if pd.notna(result["db_sil"]) else "not available")
+    st.markdown("**Cluster assignments**")
+    st.dataframe(df[["Cluster","Cluster_Agglomerative","Cluster_DBSCAN"]].head(100),use_container_width=True)
 elif page == "Model comparison":
-    st.subheader("Clustering algorithm comparison")
-    st.dataframe(results["comparison"].round(3), use_container_width=True)
-    st.caption(
-        "For deployment responsiveness, Agglomerative clustering and DBSCAN comparisons "
-        "are evaluated on a reproducible sample of up to 3,000 records; K-Means is fitted "
-        "to all available analytical records. Compare metrics with this sampling caveat in mind."
-    )
-    st.markdown("#### DBSCAN parameter search")
-    st.dataframe(results["db_results"].round(3), use_container_width=True)
-    st.markdown("Higher silhouette is generally better; lower Davies–Bouldin is generally better. "
-                "Neither metric alone determines educational usefulness.")
-
-elif page == "Cluster profiles":
-    st.subheader("Behavioural profiles")
-    st.markdown("#### Mean values by K-Means cluster")
-    st.dataframe(results["profiles"], use_container_width=True)
-    st.markdown("#### Standardised cluster centroids")
-    st.dataframe(results["centroids"].round(2), use_container_width=True)
-    fig, ax = plt.subplots(figsize=(10, 5))
-    sns.heatmap(results["centroids"], annot=True, fmt=".2f", cmap="vlag", center=0, ax=ax)
-    ax.set_title("Standardised behavioural cluster centroids")
-    st.pyplot(fig)
-    plt.close(fig)
-
+    st.subheader("Comparison of clustering algorithms")
+    st.dataframe(result["comparison"],use_container_width=True)
+    st.write("Best internal-silhouette model:", result["best_model"])
+elif page == "Cluster profiles and recommendations":
+    st.subheader("Cluster profiles")
+    st.dataframe(result["cluster_profile"],use_container_width=True)
+    st.markdown("**Standardized cluster centroids**")
+    st.dataframe(result["centroid_profile"],use_container_width=True)
+    fig,ax=plt.subplots(figsize=(11,6)); sns.heatmap(result["centroid_profile"],annot=True,fmt=".2f",cmap="vlag",center=0,ax=ax); ax.set_title("Standardized Behavioral Cluster Centroids"); st.pyplot(fig); plt.close(fig)
+    size_plot=df["Cluster"].value_counts().sort_index().rename_axis("Cluster").reset_index(name="Students")
+    fig,ax=plt.subplots(figsize=(8,5)); sns.barplot(data=size_plot,x="Cluster",y="Students",ax=ax); ax.set_title("Number of Students in Each Behavioral Cluster"); st.pyplot(fig); plt.close(fig)
+    st.markdown("**Empirical descriptions and support recommendations**")
+    st.dataframe(result["recommendation_table"],use_container_width=True)
+    st.markdown("**Contextual profile**"); st.dataframe(result["context_profile"],use_container_width=True)
 elif page == "Learning-style validation":
-    st.subheader("Learning-style validation")
-    st.write(
-        "LearningStyle was not used to create the clusters. This section checks whether "
-        "the behavioural clusters align with the dataset's reported learning-style categories."
-    )
-    c1, c2 = st.columns(2)
-    c1.metric("Adjusted Rand Index (ARI)", f"{results['ari']:.3f}")
-    c2.metric("Normalized Mutual Information (NMI)", f"{results['nmi']:.3f}")
-    st.markdown("#### Learning-style composition within each cluster (%)")
-    st.dataframe(results["learning_crosstab"], use_container_width=True)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    sns.heatmap(results["learning_crosstab"], annot=True, fmt=".1f", cmap="Blues", ax=ax)
-    ax.set_title("Learning-style composition by behavioural cluster")
-    ax.set_xlabel("Reported LearningStyle")
-    ax.set_ylabel("K-Means cluster")
-    st.pyplot(fig)
-    plt.close(fig)
-    st.caption("A low ARI or NMI does not automatically mean clustering failed; behavioural groups may not map neatly to reported categories.")
-
+    st.subheader("Behavioral clusters versus reported LearningStyle")
+    st.dataframe(result["crosstab"],use_container_width=True)
+    c1,c2=st.columns(2); c1.metric("Adjusted Rand Index",f'{result["ari"]:.3f}'); c2.metric("Normalized Mutual Information",f'{result["nmi"]:.3f}')
+    fig,ax=plt.subplots(figsize=(9,6)); sns.heatmap(result["crosstab"],annot=True,fmt=".1f",cmap="Blues",cbar_kws={"label":"Percent within cluster"},ax=ax); ax.set(title="Learning-Style Composition of Behavioral Clusters",xlabel="LearningStyle code",ylabel="Behavioral cluster"); st.pyplot(fig); plt.close(fig)
+    st.caption("Reported LearningStyle is evaluated after clustering; it is not used to create the clusters.")
 elif page == "Academic outcomes":
-    st.subheader("Academic outcome profiling")
-    st.write("ExamScore and FinalGrade were not used as clustering inputs.")
-    st.dataframe(results["outcome_profile"], use_container_width=True)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    sns.boxplot(data=df, x="Cluster", y="ExamScore", ax=ax)
-    ax.set_title("Exam score by behavioural cluster")
-    st.pyplot(fig)
-    plt.close(fig)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("ANOVA F-statistic", f"{results['anova_f']:.3f}" if pd.notna(results["anova_f"]) else "N/A")
-    c2.metric("ANOVA p-value", f"{results['anova_p']:.4g}" if pd.notna(results["anova_p"]) else "N/A")
-    c3.metric("Eta-squared", f"{results['eta_squared']:.3f}" if pd.notna(results["eta_squared"]) else "N/A")
-    if pd.notna(results["anova_p"]):
-        if results["anova_p"] < 0.05:
-            st.info("The ANOVA detected a statistically significant difference in mean ExamScore across at least some clusters.")
-        else:
-            st.info("The ANOVA did not detect a statistically significant difference in mean ExamScore across clusters.")
-    st.caption("ANOVA assumptions should be assessed before drawing strong conclusions; statistical association does not establish causation.")
-
-elif page == "Recommendations":
-    st.subheader("Suggested educational support")
-    st.write(
-        "Recommendations are rule-based and linked to behavioural features below the overall "
-        "dataset mean. They are prompts for support planning, not diagnoses or fixed labels."
-    )
-    st.dataframe(results["recommendations"], use_container_width=True)
+    st.subheader("Academic outcomes by behavioral cluster")
+    st.dataframe(result["outcome_profile"],use_container_width=True)
+    fig,ax=plt.subplots(figsize=(10,6)); sns.boxplot(data=df,x="Cluster",y="ExamScore",ax=ax); ax.set_title("Exam Score by Behavioral Cluster"); st.pyplot(fig); plt.close(fig)
+    st.write(f'ANOVA F-statistic: {result["anova"].statistic:.3f}')
+    st.write(f'ANOVA p-value: {result["anova"].pvalue:.6g}')
+    st.write(f'Eta-squared: {result["eta_squared"]:.3f}')
+    st.write("Interpretation: mean ExamScore differs significantly across at least some behavioral clusters." if result["anova"].pvalue<.05 else "Interpretation: no statistically significant difference in mean ExamScore was detected across clusters.")
+elif page == "Executive summary":
+    st.subheader("Capstone executive summary")
+    summary = {"Raw records available": result["raw_n"], "Exact duplicates removed": result["duplicate_count"], "Final analytical records": len(df), "Behavioral features used": len(CLUSTER_FEATURES), "Selected K-Means clusters": result["best_k"], "K-Means silhouette": round(result["k_sil"],3), "K-Means Davies-Bouldin": round(result["k_dbi"],3), "Agglomerative silhouette": round(result["agg_sil"],3), "DBSCAN silhouette": round(result["db_sil"],3) if pd.notna(result["db_sil"]) else "not available", "LearningStyle ARI": round(result["ari"],3), "LearningStyle NMI": round(result["nmi"],3), "ExamScore ANOVA p-value": f'{result["anova"].pvalue:.6g}', "ExamScore eta-squared": round(result["eta_squared"],3)}
+    st.dataframe(pd.DataFrame({"Metric":summary.keys(),"Value":summary.values()}),hide_index=True,use_container_width=True)
+    st.markdown("**Cluster profiles and recommended support**")
+    st.dataframe(result["recommendation_table"],use_container_width=True)
+    st.download_button("Download analysed dataset (includes cluster labels)",df.to_csv(index=False).encode(),"student_learning_style_clustered_dataset.csv","text/csv")
+    st.markdown("**Capstone PowerPoint**")
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    presentation = Presentation()
+    presentation.slide_width = Inches(13.333)
+    presentation.slide_height = Inches(7.5)
+    def add_bullet_slide(title, bullets):
+        slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+        slide.shapes.title.text = title
+        frame = slide.placeholders[1].text_frame
+        frame.clear()
+        for i, bullet in enumerate(bullets):
+            paragraph = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
+            paragraph.text = str(bullet)
+            paragraph.level = 0
+            paragraph.font.size = Pt(18)
+    title_slide = presentation.slides.add_slide(presentation.slide_layouts[0])
+    title_slide.shapes.title.text = "Student Learning-Style Clustering Based on Learning Behavior"
+    title_slide.placeholders[1].text = "AI/ML Engineer Certification Capstone"
+    add_bullet_slide("1. Problem and Objective", [
+        "Discover student learning-behavior profiles using unsupervised machine learning.",
+        "K-Means is validated against hierarchical clustering and DBSCAN.",
+        "LearningStyle is evaluated after clustering, not used to create clusters.",
+        "Academic performance is held out from clustering and examined afterward."
+    ])
+    add_bullet_slide("2. Dataset", [
+        f"Source: {source}.",
+        f"Raw records: {result['raw_n']:,}.",
+        f"Exact duplicates removed: {result['duplicate_count']:,}.",
+        f"Final analytical records: {len(df):,}."
+    ])
+    add_bullet_slide("3. Behavioral Feature Strategy", CLUSTER_FEATURES + [
+        "LearningStyle, ExamScore and FinalGrade were excluded from clustering."
+    ])
+    add_bullet_slide("4. Model Selection", [
+        f"Selected K-Means k: {result['best_k']}.",
+        f"K-Means silhouette: {result['k_sil']:.3f}.",
+        f"K-Means Davies-Bouldin index: {result['k_dbi']:.3f}.",
+        f"Agglomerative silhouette: {result['agg_sil']:.3f}.",
+        f"DBSCAN silhouette: {result['db_sil']:.3f}" if pd.notna(result['db_sil']) else "DBSCAN did not produce a valid multi-cluster solution."
+    ])
+    add_bullet_slide("5. Behavioral Cluster Profiles", [
+        f"Cluster {int(row['Cluster'])}: {row['Observed_behavior']}"
+        for _, row in result["recommendation_table"].iterrows()
+    ])
+    add_bullet_slide("6. Learning-Style Validation", [
+        f"Adjusted Rand Index: {result['ari']:.3f}.",
+        f"Normalized Mutual Information: {result['nmi']:.3f}.",
+        "Reported learning style is an external comparison, not a clustering input."
+    ])
+    add_bullet_slide("7. Academic Outcome Analysis", [
+        f"ExamScore ANOVA p-value: {result['anova'].pvalue:.6g}.",
+        f"Eta-squared: {result['eta_squared']:.3f}.",
+        "ExamScore was excluded from clustering and analyzed afterward."
+    ])
+    add_bullet_slide("8. Recommended Educational Support", [
+        f"Cluster {int(row['Cluster'])}: {row['Recommended_support']}"
+        for _, row in result["recommendation_table"].iterrows()
+    ])
+    add_bullet_slide("9. Limitations", [
+        "Secondary dataset with incomplete documentation of recruitment and sampling.",
+        "Behavioral variables are structured proxies, not a live LMS event log.",
+        "Clusters are not permanent student identities.",
+        "Associations do not establish causation."
+    ])
+    add_bullet_slide("10. Conclusion", [
+        f"The pipeline identified {result['best_k']} behavioral segments using K-Means.",
+        "Behavioral segmentation can support differentiated educational interventions.",
+        "LearningStyle was used as an external comparison.",
+        "Profiles convert learning-behavior variables into interpretable student segments."
+    ])
+    pptx_buffer = BytesIO()
+    presentation.save(pptx_buffer)
     st.download_button(
-        "Download cluster assignments and recommendations",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="student_cluster_assignments.csv",
-        mime="text/csv",
+        "Download capstone PowerPoint",
+        data=pptx_buffer.getvalue(),
+        file_name="student_learning_style_clustering_capstone.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
     )
-
-st.divider()
-st.caption(
-    "TechCrush Cohort 8 AI/ML Capstone · Student Learning-Style Clustering Based on Learning Behavior"
-)
